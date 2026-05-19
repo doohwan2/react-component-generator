@@ -143,6 +143,109 @@ function ensureRenderCall(code: string): string {
   return code;
 }
 
+function sseEvent(event: string, data: Record<string, unknown>): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+async function* streamAnthropic(
+  prompt: string,
+  apiKey: string
+): AsyncGenerator<string> {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 4096,
+      stream: true,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Claude API error: ${response.status}`);
+  }
+
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+
+    for (const line of chunk.split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      const raw = line.slice(6).trim();
+      if (raw === '[DONE]') return;
+      try {
+        const parsed = JSON.parse(raw) as {
+          type?: string;
+          delta?: { type?: string; text?: string };
+        };
+        if (
+          parsed.type === 'content_block_delta' &&
+          parsed.delta?.type === 'text_delta'
+        ) {
+          yield parsed.delta.text || '';
+        }
+      } catch {
+        // 파싱 실패 무시
+      }
+    }
+  }
+}
+
+async function* streamGoogle(
+  prompt: string,
+  apiKey: string
+): AsyncGenerator<string> {
+  const model = 'gemini-2.5-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: 8192 },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Gemini API error: ${response.status}`);
+  }
+
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+
+    for (const line of chunk.split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      const raw = line.slice(6).trim();
+      try {
+        const parsed = JSON.parse(raw) as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+        };
+        const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) yield text;
+      } catch {
+        // 파싱 실패 무시
+      }
+    }
+  }
+}
+
 const server = Bun.serve({
   port: 3002,
   async fetch(req) {
@@ -218,6 +321,77 @@ const server = Bun.serve({
           { status: 500, headers: CORS_HEADERS }
         );
       }
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/generate-stream') {
+      const stream = new ReadableStream({
+        async start(controller) {
+          const encoder = new TextEncoder();
+          const enqueue = (event: string, data: Record<string, unknown>) =>
+            controller.enqueue(encoder.encode(sseEvent(event, data)));
+
+          try {
+            const { prompt, apiKey, provider = 'anthropic' } = (await req.json()) as {
+              prompt: string;
+              apiKey?: string;
+              provider?: Provider;
+            };
+
+            const resolvedKey = resolveApiKey(provider, apiKey);
+
+            if (!resolvedKey) {
+              enqueue('error', {
+                message: `API key is required. Set ${provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'GOOGLE_API_KEY'} in .env or enter it manually.`,
+              });
+              controller.close();
+              return;
+            }
+
+            if (!prompt) {
+              enqueue('error', { message: 'Prompt is required' });
+              controller.close();
+              return;
+            }
+
+            const generator =
+              provider === 'google'
+                ? streamGoogle(prompt, resolvedKey)
+                : streamAnthropic(prompt, resolvedKey);
+
+            let accumulated = '';
+            for await (const chunk of generator) {
+              accumulated += chunk;
+              enqueue('chunk', { text: chunk });
+            }
+
+            const finalCode = ensureRenderCall(stripCodeFences(accumulated));
+            enqueue('done', { code: finalCode });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : 'Unknown error';
+
+            let friendlyMessage = message;
+            if (message.includes('503')) {
+              friendlyMessage =
+                'API 서버가 일시적으로 과부하 상태입니다. 잠시 후 다시 시도해주세요.';
+            } else if (message.includes('429')) {
+              friendlyMessage = '요청이 너무 많습니다. 잠시 후 다시 시도해주세요.';
+            }
+
+            enqueue('error', { message: friendlyMessage });
+          } finally {
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          ...CORS_HEADERS,
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        },
+      });
     }
 
     return Response.json(

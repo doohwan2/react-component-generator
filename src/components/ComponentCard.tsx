@@ -39,7 +39,7 @@ export function ComponentCard({ component, onRemove, onRegenerate, isLoading }: 
           <button
             className="btn-regenerate"
             onClick={() => onRegenerate(component.prompt)}
-            disabled={isLoading}
+            disabled={isLoading || component.isStreaming}
           >
             {isLoading ? '생성 중...' : '재생성'}
           </button>
@@ -67,7 +67,7 @@ export function ComponentCard({ component, onRemove, onRegenerate, isLoading }: 
       </div>
       <div className="card-content">
         {activeTab === 'preview' ? (
-          <LivePreview key={previewKey} code={component.code} />
+          <LivePreview key={previewKey} code={component.code} isStreaming={component.isStreaming} />
         ) : (
           <CodeView code={component.code} />
         )}
